@@ -39,9 +39,9 @@ public class AverageSensorReadings {
         // set up the streaming execution environment
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 
-        // use event time for the application
+        // use event time for the application 使用事件时间
         env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
-        // configure watermark interval
+        // configure watermark interval 水位线
         env.getConfig().setAutoWatermarkInterval(1000L);
 
         // ingest sensor stream
