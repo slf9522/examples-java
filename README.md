@@ -8,3 +8,5 @@ The [Scala examples](https://github.com/streaming-with-flink/examples-scala) are
 <a href="http://shop.oreilly.com/product/0636920057321.do">
   <img width="240" src="https://covers.oreillystatic.com/images/0636920057321/cat.gif">
 </a>
+
+# 对应scala版本增加了java代码示例，更新至第六章
