@@ -19,16 +19,20 @@ import io.github.streamingwithflink.util.SensorReading;
 import io.github.streamingwithflink.util.SensorSource;
 import io.github.streamingwithflink.util.SensorTimeAssigner;
 import org.apache.flink.api.common.ExecutionConfig;
+import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
+import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.api.java.tuple.Tuple4;
 import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
 import org.apache.flink.streaming.api.windowing.assigners.WindowAssigner;
+import org.apache.flink.streaming.api.windowing.time.Time;
 import org.apache.flink.streaming.api.windowing.triggers.EventTimeTrigger;
 import org.apache.flink.streaming.api.windowing.triggers.Trigger;
 import org.apache.flink.streaming.api.windowing.triggers.TriggerResult;
@@ -37,6 +41,7 @@ import org.apache.flink.util.Collector;
 
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Iterator;
 
 public class CustomWindow {
 
@@ -61,15 +66,34 @@ public class CustomWindow {
                 .assignTimestampsAndWatermarks(new SensorTimeAssigner());
 
         DataStream<Tuple4<String, Long, Long, Integer>> countsPerThirtySecs = sensorData
-            .keyBy(r -> r.id)
-            // a custom window assigner for 30 seconds tumbling windows
-            .window(new ThirtySecondsWindows())
-            // a custom trigger that fires early (at most) every second
-            .trigger(new OneSecondIntervalTrigger())
-            // count readings per window
-            .process(new CountFunction());
+                .keyBy(r -> r.id)
+                // a custom window assigner for 30 seconds tumbling windows
+                .window(new ThirtySecondsWindows())
+                // a custom trigger that fires early (at most) every second
+                .trigger(new OneSecondIntervalTrigger())
+                // count readings per window
+                .process(new CountFunction());
 
         countsPerThirtySecs.print();
+
+        DataStream<MinMaxTemp> minMaxTempPerWindow =
+                sensorData.keyBy(r -> r.id).timeWindow(Time.seconds(5)).process(new HighAndLowTempProcessFunction());
+        minMaxTempPerWindow.print();
+
+        DataStream<MinMaxTemp> minMaxTempDataStream =
+                sensorData
+                        .map(r -> new Tuple3<>(r.id, r.temperature, r.temperature))
+                        .keyBy(r -> r.f0)
+                        .timeWindow(Time.seconds(5))
+                        .reduce(
+                                (Tuple3<String, Double, Double> r1, Tuple3<String, Double, Double> r2) -> {
+                                    return new Tuple3<String, Double, Double>(
+                                            r1.f0, Math.min(r1.f1, r2.f1), Math.max(r1.f2, r2.f2)
+                                    );
+                                },
+                                new AssignWindowEndProcessFunction()
+                        );
+        minMaxTempDataStream.print();
 
         env.execute("Run custom window example");
     }
@@ -108,7 +132,7 @@ public class CustomWindow {
     }
 
     /**
-     * A trigger thet fires early. The trigger fires at most every second.
+     * A trigger thet fires early. The trigger fires at most every second. 可提前触发的计时器，触发周期不小于1s
      */
     public static class OneSecondIntervalTrigger extends Trigger<SensorReading, TimeWindow> {
 
@@ -116,7 +140,7 @@ public class CustomWindow {
         public TriggerResult onElement(SensorReading r, long ts, TimeWindow w, TriggerContext ctx) throws Exception {
             // firstSeen will be false if not set yet
             ValueState<Boolean> firstSeen = ctx.getPartitionedState(
-                new ValueStateDescriptor<>("firstSeen", Types.BOOLEAN));
+                    new ValueStateDescriptor<>("firstSeen", Types.BOOLEAN));
 
             // register initial timer only for first element
             if (firstSeen.value() == null) {
@@ -157,7 +181,7 @@ public class CustomWindow {
         public void clear(TimeWindow w, TriggerContext ctx) throws Exception {
             // clear trigger state
             ValueState<Boolean> firstSeen = ctx.getPartitionedState(
-                new ValueStateDescriptor<>("firstSeen", Types.BOOLEAN));
+                    new ValueStateDescriptor<>("firstSeen", Types.BOOLEAN));
             firstSeen.clear();
         }
     }
@@ -166,9 +190,11 @@ public class CustomWindow {
      * A window function that counts the readings per sensor and window.
      * The function emits the sensor id, window end, tiem of function evaluation, and count.
      */
+//    计算每个窗口内的最低和最高温，每个窗口都会发出一条记录，包含了窗口的开始、技术时间以及窗口内的最低、最高温度
     public static class CountFunction
             extends ProcessWindowFunction<SensorReading, Tuple4<String, Long, Long, Integer>, String, TimeWindow> {
 
+        //        对窗口执行计算
         @Override
         public void process(
                 String id,
@@ -184,6 +210,80 @@ public class CustomWindow {
             long evalTime = ctx.currentWatermark();
             // emit result
             out.collect(Tuple4.of(id, ctx.window().getEnd(), evalTime, cnt));
+        }
+    }
+
+    // 输入， 累加器， 输出
+    public static class AvgTempFunction implements AggregateFunction<Tuple2<String, Double>, Tuple3<String, Double,
+            Integer>, Tuple2<String, Double>> {
+        @Override
+        public Tuple3<String, Double, Integer> createAccumulator() {
+            return new Tuple3<>("", 0.0, 0);
+        }
+
+        // 温度总和，事件次数
+        @Override
+        public Tuple3<String, Double, Integer> add(Tuple2<String, Double> input, Tuple3<String, Double,
+                Integer> agg) {
+            return new Tuple3<>(input.f0, input.f1 + agg.f1, 1 + agg.f2);
+        }
+
+        // 根据累加器计算并返回结果
+        @Override
+        public Tuple2<String, Double> getResult(Tuple3<String, Double, Integer> agg) {
+            return new Tuple2<>(agg.f0, agg.f1 / agg.f2);
+        }
+
+        @Override
+        public Tuple3<String, Double, Integer> merge(Tuple3<String, Double, Integer> agg1,
+                                                     Tuple3<String, Double, Integer> agg2) {
+            return new Tuple3<>(agg1.f0, agg1.f1 + agg2.f1, agg1.f2 + agg2.f2);
+        }
+    }
+
+    public static class MinMaxTemp {
+        String id;
+        Double min;
+        Double max;
+        Long endTs;
+
+        public MinMaxTemp() {
+        }
+
+        public MinMaxTemp(String id, Double min, Double max, Long endTs) {
+            this.id = id;
+            this.min = min;
+            this.max = max;
+            this.endTs = endTs;
+        }
+
+        public String toString() {
+            return "(" + this.id + ", " + this.min + ", " + this.max + ", " + this.endTs + ")";
+        }
+    }
+
+    public static class HighAndLowTempProcessFunction extends ProcessWindowFunction<SensorReading, MinMaxTemp, String
+            , TimeWindow> {
+        @Override
+        public void process(String key, Context context, Iterable<SensorReading> elements, Collector<MinMaxTemp> out) throws Exception {
+            double min = Double.MAX_VALUE, max = Double.MIN_VALUE;
+            Iterator<SensorReading> iterator = elements.iterator();
+            while (iterator.hasNext()) {
+                Double next = iterator.next().temperature;
+                min = Math.min(min, next);
+                max = Math.max(max, next);
+            }
+            out.collect(new MinMaxTemp(key, min, max, context.window().getEnd()));
+        }
+    }
+
+    public static class AssignWindowEndProcessFunction extends ProcessWindowFunction<Tuple3<String, Double, Double>,
+            MinMaxTemp, String, TimeWindow> {
+        @Override
+        public void process(String s, Context context, Iterable<Tuple3<String, Double, Double>> elements,
+                            Collector<MinMaxTemp> out) throws Exception {
+            Tuple3<String, Double, Double> minMax = elements.iterator().next();
+            out.collect(new MinMaxTemp(s, minMax.f1, minMax.f2, context.window().getEnd()));
         }
     }
 }
